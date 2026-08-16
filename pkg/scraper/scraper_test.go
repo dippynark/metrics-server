@@ -88,18 +88,7 @@ var _ = Describe("Scraper", func() {
 				node1: mb,
 				node2: {Nodes: map[string]storage.MetricsPoint{node2.Name: metricPoint(100, 200, scrapeTime)}},
 				node3: {Nodes: map[string]storage.MetricsPoint{node3.Name: metricPoint(100, 200, scrapeTime)}},
-				// node4 returns a duplicate Pod ns1/pod1 (also on node1) with a newer container
-				// StartTime to test that the scraper always keeps the most recent instance
-				node4: {
-					Nodes: map[string]storage.MetricsPoint{node4.Name: metricPoint(100, 200, scrapeTime)},
-					Pods: map[apitypes.NamespacedName]storage.PodMetricsPoint{
-						{Namespace: "ns1", Name: "pod1"}: {
-							Containers: map[string]storage.MetricsPoint{
-								"container1": {StartTime: scrapeTime, Timestamp: scrapeTime, CumulativeCPUUsed: 999, MemoryUsage: 999},
-							},
-						},
-					},
-				},
+				node4: {Nodes: map[string]storage.MetricsPoint{node4.Name: metricPoint(100, 200, scrapeTime)}},
 			},
 		}
 
@@ -144,7 +133,7 @@ var _ = Describe("Scraper", func() {
 
 			By("ensuring that an error and partial results (data from source 2) were returned")
 			Expect(nodeNames(dataBatch)).To(ConsistOf([]string{"node-no-host", "node3", "node4"}))
-			Expect(podNames(dataBatch)).To(ConsistOf([]string{"ns1/pod1"}))
+			Expect(podNames(dataBatch)).To(BeEmpty())
 		})
 
 		It("should respect the parent context's general timeout, even with a longer scrape timeout", func() {
@@ -238,19 +227,39 @@ var _ = Describe("Scraper", func() {
 		scraper.Scrape(context.Background())
 	})
 	It("should keep the pod with the latest container start time on duplicates", func() {
-		By("running the scraper")
+		By("adding duplicate metrics for one of node1's pods to node4 with a later container start time")
+		var podKey apitypes.NamespacedName
+		var containerName string
+		var containerLatestStartTime time.Time
+		for podKey = range client.metrics[node1].Pods {
+			for containerName = range client.metrics[node1].Pods[podKey].Containers {
+				containerStartTime := client.metrics[node1].Pods[podKey].Containers[containerName].StartTime
+				if containerLatestStartTime.Before(containerStartTime) {
+					containerLatestStartTime = containerStartTime
+				}
+			}
+			break
+		}
+		duplicatePodMetrics := storage.PodMetricsPoint{
+			// Set container start time to a later time than on node1
+			Containers: map[string]storage.MetricsPoint{containerName: metricPoint(999, 999, containerLatestStartTime.Add(time.Second))},
+		}
+		client.metrics[node4].Pods = map[apitypes.NamespacedName]storage.PodMetricsPoint{
+			podKey: duplicatePodMetrics,
+		}
 		scraper := NewScraper(&nodeLister, &client, 5*time.Second, labelRequirement)
 
-		By("ensuring the pod with the newer start time is kept")
-		batch := scraper.Scrape(context.Background())
-		podKey := apitypes.NamespacedName{Namespace: "ns1", Name: "pod1"}
-		Expect(batch.Pods).To(HaveKey(podKey))
-		Expect(batch.Pods[podKey].Containers["container1"].CumulativeCPUUsed).To(Equal(uint64(999)))
+		By("running the scraper")
+		dataBatch := scraper.Scrape(context.Background())
+
+		By("ensuring node4's newer metrics are the ones kept")
+		Expect(dataBatch.Pods).To(HaveKeyWithValue(podKey, duplicatePodMetrics))
 	})
 })
 
 func metricPoint(cpu, memory uint64, time time.Time) storage.MetricsPoint {
 	return storage.MetricsPoint{
+		StartTime:         time,
 		Timestamp:         time,
 		CumulativeCPUUsed: cpu,
 		MemoryUsage:       memory,
